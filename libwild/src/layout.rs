@@ -236,7 +236,7 @@ pub fn compute<'data, A: Arch>(
         output_order.display(&output_sections, &program_segments)
     );
 
-    let section_part_sizes = compute_total_section_part_sizes(
+    let mut section_part_sizes = compute_total_section_part_sizes(
         &mut group_states,
         &mut output_sections,
         &output_order,
@@ -246,42 +246,76 @@ pub fn compute<'data, A: Arch>(
         &finalise_sizes_resources,
     )?;
 
-    let section_part_layouts = layout_section_parts(
-        &section_part_sizes,
-        &output_sections,
-        &program_segments,
-        &output_order,
-        symbol_db.args,
-    );
-    let section_layouts = layout_sections(&output_sections, &section_part_layouts);
-    let mut merged_section_layouts = section_layouts.clone();
-    merge_secondary_parts(&output_sections, &mut merged_section_layouts);
+    let mut aarch64_branch_thunks =
+        (A::KIND == crate::arch::Architecture::AArch64).then(AArch64BranchThunks::default);
+
+    let (
+        section_part_layouts,
+        section_layouts,
+        merged_section_layouts,
+        segment_layouts,
+        starting_mem_offsets_by_group,
+        merged_string_start_addresses,
+    ) = if aarch64_branch_thunks.is_some() {
+        plan_and_apply_aarch64_branch_thunks(
+            &mut group_states,
+            &mut section_part_sizes,
+            &mut aarch64_branch_thunks,
+            &symbol_db,
+            &per_symbol_flags,
+            &output_sections,
+            &output_order,
+            &program_segments,
+            &merged_strings,
+        )?
+    } else {
+        let section_part_layouts = layout_section_parts(
+            &section_part_sizes,
+            &output_sections,
+            &program_segments,
+            &output_order,
+            symbol_db.args,
+        );
+        let section_layouts = layout_sections(&output_sections, &section_part_layouts);
+        let mut merged_section_layouts = section_layouts.clone();
+        merge_secondary_parts(&output_sections, &mut merged_section_layouts);
+
+        let Some(FileLayoutState::Prelude(internal)) =
+            &group_states.first().and_then(|g| g.files.first())
+        else {
+            unreachable!();
+        };
+        let header_info = internal.header_info.as_ref().unwrap();
+        let segment_layouts = compute_segment_layout(
+            &section_layouts,
+            &output_sections,
+            &output_order,
+            &program_segments,
+            header_info,
+            symbol_db.args,
+        )?;
+
+        let mem_offsets: OutputSectionPartMap<u64> = starting_memory_offsets(&section_part_layouts);
+        let starting_mem_offsets_by_group =
+            compute_start_offsets_by_group(&group_states, mem_offsets);
+
+        let merged_string_start_addresses = MergedStringStartAddresses::compute(
+            &output_sections,
+            &starting_mem_offsets_by_group,
+            &merged_strings,
+        );
+
+        (
+            section_part_layouts,
+            section_layouts,
+            merged_section_layouts,
+            segment_layouts,
+            starting_mem_offsets_by_group,
+            merged_string_start_addresses,
+        )
+    };
 
     output.set_size(compute_total_file_size(&section_layouts));
-
-    let Some(FileLayoutState::Prelude(internal)) =
-        &group_states.first().and_then(|g| g.files.first())
-    else {
-        unreachable!();
-    };
-    let header_info = internal.header_info.as_ref().unwrap();
-    let segment_layouts = compute_segment_layout(
-        &section_layouts,
-        &output_sections,
-        &output_order,
-        &program_segments,
-        header_info,
-        symbol_db.args,
-    )?;
-
-    let mem_offsets: OutputSectionPartMap<u64> = starting_memory_offsets(&section_part_layouts);
-    let starting_mem_offsets_by_group = compute_start_offsets_by_group(&group_states, mem_offsets);
-
-    let merged_string_start_addresses = MergedStringStartAddresses::compute(
-        &output_sections,
-        &starting_mem_offsets_by_group,
-        &merged_strings,
-    );
 
     let mut symbol_resolutions = SymbolResolutions {
         resolutions: Vec::with_capacity(symbol_db.num_symbols()),
@@ -353,7 +387,571 @@ pub fn compute<'data, A: Arch>(
         dynamic_symbol_definitions,
         gnu_property_notes,
         riscv_attributes,
+        aarch64_branch_thunks,
     })
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct AArch64BranchThunks {
+    sections: HashMap<(FileId, usize), AArch64BranchThunkSection>,
+}
+
+#[derive(Debug)]
+pub(crate) struct AArch64BranchThunkSection {
+    /// Thunks for this section, sorted by `offset_in_section`.
+    pub(crate) thunks: Vec<AArch64BranchThunk>,
+
+    /// Map from absolute target address to the thunk's offset within the section.
+    pub(crate) by_target_address: HashMap<u64, u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AArch64BranchThunk {
+    pub(crate) target_address: u64,
+    pub(crate) offset_in_section: u32,
+}
+
+impl AArch64BranchThunks {
+    pub(crate) fn section(
+        &self,
+        file_id: FileId,
+        section_index: object::SectionIndex,
+    ) -> Option<&AArch64BranchThunkSection> {
+        self.sections.get(&(file_id, section_index.0))
+    }
+
+    pub(crate) fn thunk_offset_for_target(
+        &self,
+        file_id: FileId,
+        section_index: object::SectionIndex,
+        target_address: u64,
+    ) -> Option<u32> {
+        self.section(file_id, section_index)
+            .and_then(|s| s.by_target_address.get(&target_address).copied())
+    }
+}
+
+const AARCH64_BRANCH_THUNK_ALIGN: Alignment = Alignment { exponent: 2 }; // 4 bytes
+const AARCH64_BRANCH_THUNK_SIZE: u64 = 12;
+
+type AArch64ThunkPlanningResult = (
+    OutputSectionPartMap<OutputRecordLayout>,
+    OutputSectionMap<OutputRecordLayout>,
+    OutputSectionMap<OutputRecordLayout>,
+    SegmentLayouts,
+    Vec<OutputSectionPartMap<u64>>,
+    MergedStringStartAddresses,
+);
+
+fn plan_and_apply_aarch64_branch_thunks<'data>(
+    group_states: &mut [GroupState<'data>],
+    section_part_sizes: &mut OutputSectionPartMap<u64>,
+    aarch64_branch_thunks: &mut Option<AArch64BranchThunks>,
+    symbol_db: &SymbolDb<'data>,
+    per_symbol_flags: &PerSymbolFlags,
+    output_sections: &OutputSections<'data>,
+    output_order: &OutputOrder,
+    program_segments: &ProgramSegments,
+    merged_strings: &OutputSectionMap<MergedStringsSection<'data>>,
+) -> Result<AArch64ThunkPlanningResult> {
+    let args = symbol_db.args;
+    let output_kind = symbol_db.output_kind;
+
+    let mut iterations = 0;
+    let mut thunks;
+
+    loop {
+        iterations += 1;
+        ensure!(
+            iterations <= 16,
+            "AArch64 branch thunk planning did not converge"
+        );
+
+        let section_part_layouts = layout_section_parts(
+            section_part_sizes,
+            output_sections,
+            program_segments,
+            output_order,
+            args,
+        );
+        let section_layouts = layout_sections(output_sections, &section_part_layouts);
+        let mut merged_section_layouts = section_layouts.clone();
+        merge_secondary_parts(output_sections, &mut merged_section_layouts);
+
+        let Some(FileLayoutState::Prelude(prelude)) =
+            &group_states.first().and_then(|g| g.files.first())
+        else {
+            unreachable!();
+        };
+        let header_info = prelude.header_info.as_ref().unwrap();
+        let segment_layouts = compute_segment_layout(
+            &section_layouts,
+            output_sections,
+            output_order,
+            program_segments,
+            header_info,
+            args,
+        )?;
+
+        let mem_offsets: OutputSectionPartMap<u64> = starting_memory_offsets(&section_part_layouts);
+        let starting_mem_offsets_by_group =
+            compute_start_offsets_by_group(group_states, mem_offsets);
+        let merged_string_start_addresses = MergedStringStartAddresses::compute(
+            output_sections,
+            &starting_mem_offsets_by_group,
+            merged_strings,
+        );
+
+        let simulated_resolutions = simulate_symbol_resolutions_for_aarch64_branch_thunks(
+            group_states,
+            &starting_mem_offsets_by_group,
+            symbol_db,
+            per_symbol_flags,
+            merged_strings,
+            &merged_string_start_addresses,
+        )?;
+
+        let required = collect_required_aarch64_branch_thunks(
+            group_states,
+            &starting_mem_offsets_by_group,
+            symbol_db,
+            per_symbol_flags,
+            output_kind,
+            &simulated_resolutions,
+        )?;
+
+        thunks = build_aarch64_branch_thunk_plan(group_states, &required);
+
+        let changed = apply_aarch64_branch_thunk_sizes(group_states, section_part_sizes, &thunks)?;
+        if !changed {
+            *aarch64_branch_thunks = Some(thunks);
+            return Ok((
+                section_part_layouts,
+                section_layouts,
+                merged_section_layouts,
+                segment_layouts,
+                starting_mem_offsets_by_group,
+                merged_string_start_addresses,
+            ));
+        }
+    }
+}
+
+fn simulate_symbol_resolutions_for_aarch64_branch_thunks<'data>(
+    group_states: &[GroupState<'data>],
+    starting_mem_offsets_by_group: &[OutputSectionPartMap<u64>],
+    symbol_db: &SymbolDb<'data>,
+    per_symbol_flags: &PerSymbolFlags,
+    merged_strings: &OutputSectionMap<MergedStringsSection<'data>>,
+    merged_string_start_addresses: &MergedStringStartAddresses,
+) -> Result<Vec<Option<Resolution>>> {
+    let mut resolutions = vec![None; symbol_db.num_symbols()];
+
+    for (group_index, group_state) in group_states.iter().enumerate() {
+        let mut memory_offsets = starting_mem_offsets_by_group[group_index].clone();
+
+        for file in &group_state.files {
+            match file {
+                FileLayoutState::Object(object) => {
+                    simulate_object_symbol_resolutions(
+                        object,
+                        symbol_db,
+                        per_symbol_flags,
+                        merged_strings,
+                        merged_string_start_addresses,
+                        &mut memory_offsets,
+                        &mut resolutions,
+                    )?;
+                }
+                FileLayoutState::Dynamic(dynamic) => {
+                    simulate_dynamic_symbol_resolutions(
+                        dynamic,
+                        symbol_db,
+                        per_symbol_flags,
+                        &mut memory_offsets,
+                        &mut resolutions,
+                    );
+                }
+                _ => {
+                    // Internal/synthetic symbols do not participate in AArch64 CALL26/JUMP26 thunks.
+                }
+            }
+        }
+    }
+
+    Ok(resolutions)
+}
+
+fn simulate_object_symbol_resolutions<'data>(
+    object: &ObjectLayoutState<'data>,
+    symbol_db: &SymbolDb<'data>,
+    per_symbol_flags: &PerSymbolFlags,
+    merged_strings: &OutputSectionMap<MergedStringsSection<'data>>,
+    merged_string_start_addresses: &MergedStringStartAddresses,
+    memory_offsets: &mut OutputSectionPartMap<u64>,
+    resolutions_out: &mut [Option<Resolution>],
+) -> Result {
+    let e = LittleEndian;
+    let symbol_id_range = object.symbol_id_range();
+
+    let mut section_resolutions = Vec::with_capacity(object.sections.len());
+    for slot in &object.sections {
+        let resolution = match slot {
+            SectionSlot::Loaded(sec) => {
+                let part_id = sec.part_id;
+                let address = *memory_offsets.get(part_id);
+                *memory_offsets.get_mut(part_id) += sec.capacity();
+                SectionResolution { address }
+            }
+            SectionSlot::LoadedDebugInfo(sec) => {
+                let address = *memory_offsets.get(sec.part_id);
+                *memory_offsets.get_mut(sec.part_id) += sec.capacity();
+                SectionResolution { address }
+            }
+            SectionSlot::EhFrameData(..) => {
+                let address = *memory_offsets.get(part_id::EH_FRAME);
+                SectionResolution { address }
+            }
+            _ => SectionResolution::none(),
+        };
+        section_resolutions.push(resolution);
+    }
+
+    for ((local_symbol_index, local_symbol), &flags) in object
+        .object
+        .symbols
+        .enumerate()
+        .zip(per_symbol_flags.raw_range(symbol_id_range))
+    {
+        let symbol_id = symbol_id_range.input_to_id(local_symbol_index);
+        let flags = flags.get();
+
+        if !flags.has_resolution() || !symbol_db.is_canonical(symbol_id) {
+            continue;
+        }
+
+        let raw_value = if let Some(section_index) = object
+            .object
+            .symbol_section(local_symbol, local_symbol_index)?
+        {
+            if let Some(section_address) = section_resolutions[section_index.0].address() {
+                local_symbol.st_value(e) + section_address
+            } else {
+                match get_merged_string_output_address(
+                    local_symbol_index,
+                    0,
+                    object.object,
+                    &object.sections,
+                    merged_strings,
+                    merged_string_start_addresses,
+                    true,
+                )? {
+                    Some(x) => x,
+                    None => {
+                        if symbol_db.is_mapping_symbol(symbol_id) {
+                            continue;
+                        }
+                        bail!(
+                            "Symbol is in a section that we didn't load. Symbol: {}",
+                            symbol_db.symbol_debug(per_symbol_flags, symbol_id)
+                        );
+                    }
+                }
+            }
+        } else if local_symbol.is_common(e) {
+            let common = CommonSymbol::new(local_symbol)?;
+            let output_section_id = if local_symbol.st_type() == STT_TLS {
+                output_section_id::TBSS
+            } else {
+                output_section_id::BSS
+            };
+            let offset =
+                memory_offsets.get_mut(output_section_id.part_id_with_alignment(common.alignment));
+            let address = *offset;
+            *offset += common.size;
+            address
+        } else {
+            local_symbol.st_value(e)
+        };
+
+        let resolution = create_resolution(flags, raw_value, None, memory_offsets);
+        resolutions_out[symbol_id.as_usize()] = Some(resolution);
+    }
+
+    memory_offsets.increment(part_id::EH_FRAME, object.eh_frame_size);
+
+    Ok(())
+}
+
+fn simulate_dynamic_symbol_resolutions<'data>(
+    dynamic: &DynamicLayoutState<'data>,
+    symbol_db: &SymbolDb<'data>,
+    per_symbol_flags: &PerSymbolFlags,
+    memory_offsets: &mut OutputSectionPartMap<u64>,
+    resolutions_out: &mut [Option<Resolution>],
+) {
+    for (local_index, (_local_symbol, &raw_flags)) in dynamic
+        .object
+        .symbols
+        .iter()
+        .zip(per_symbol_flags.raw_range(dynamic.symbol_id_range))
+        .enumerate()
+    {
+        let flags = raw_flags.get();
+        if !flags.has_resolution() {
+            continue;
+        }
+
+        let symbol_id = dynamic.symbol_id_range.offset_to_id(local_index);
+        if !symbol_db.is_canonical(symbol_id) {
+            continue;
+        }
+
+        // For thunk planning we only need PLT/GOT allocation and a stable PLT address.
+        let resolution = create_resolution(flags, 0, None, memory_offsets);
+        resolutions_out[symbol_id.as_usize()] = Some(resolution);
+    }
+}
+
+fn collect_required_aarch64_branch_thunks<'data>(
+    group_states: &[GroupState<'data>],
+    starting_mem_offsets_by_group: &[OutputSectionPartMap<u64>],
+    symbol_db: &SymbolDb<'data>,
+    per_symbol_flags: &PerSymbolFlags,
+    output_kind: OutputKind,
+    resolutions: &[Option<Resolution>],
+) -> Result<HashMap<(FileId, usize), HashSet<u64>>> {
+    let mut required: HashMap<(FileId, usize), HashSet<u64>> = HashMap::new();
+
+    for (group_index, group_state) in group_states.iter().enumerate() {
+        let mut memory_offsets = starting_mem_offsets_by_group[group_index].clone();
+
+        for file in &group_state.files {
+            let FileLayoutState::Object(object) = file else {
+                continue;
+            };
+
+            let file_id = object.file_id();
+            for slot in &object.sections {
+                let SectionSlot::Loaded(section) = slot else {
+                    continue;
+                };
+
+                let header = object.object.section(section.index)?;
+                let section_flags = SectionFlags::from_header(header);
+
+                let section_address = *memory_offsets.get(section.part_id);
+                *memory_offsets.get_mut(section.part_id) += section.capacity();
+
+                if !section_flags.contains(shf::EXECINSTR) {
+                    continue;
+                }
+
+                let data = object.object.raw_section_data(header)?;
+                let relocations = object
+                    .object
+                    .relocations(section.index, &object.relocations)?;
+
+                let mut handle_rel = |rel: Crel| -> Result {
+                    if rel.r_type != object::elf::R_AARCH64_CALL26
+                        && rel.r_type != object::elf::R_AARCH64_JUMP26
+                    {
+                        return Ok(());
+                    }
+
+                    let Some(local_sym_index) = rel.symbol() else {
+                        return Ok(());
+                    };
+
+                    let local_symbol_id = object.symbol_id_range.input_to_id(local_sym_index);
+                    let canonical_symbol_id = symbol_db.definition(local_symbol_id);
+
+                    let Some(mut resolution) = resolutions
+                        .get(canonical_symbol_id.as_usize())
+                        .and_then(|r| r.as_ref())
+                        .copied()
+                    else {
+                        return Ok(());
+                    };
+
+                    resolution
+                        .flags
+                        .merge(symbol_db.flags_for_symbol(per_symbol_flags, local_symbol_id));
+
+                    let place = section_address + rel.r_offset;
+
+                    let relaxation = crate::aarch64::Relaxation::new(
+                        rel.r_type,
+                        data,
+                        rel.r_offset,
+                        resolution.flags,
+                        output_kind,
+                        section_flags,
+                        resolution.raw_value != 0,
+                    )
+                    .filter(|r| symbol_db.args.relax || r.is_mandatory());
+
+                    let rel_info = if let Some(r) = relaxation {
+                        r.rel_info()
+                    } else {
+                        crate::aarch64::AArch64::relocation_from_raw(rel.r_type)?
+                    };
+
+                    let target_address = match rel_info.kind {
+                        RelocationKind::PltRelative => {
+                            resolution.plt_address()?.wrapping_add(rel.r_addend as u64)
+                        }
+                        RelocationKind::Relative => {
+                            if resolution.flags.is_ifunc() {
+                                resolution.plt_address()?.wrapping_add(rel.r_addend as u64)
+                            } else {
+                                resolution.raw_value.wrapping_add(rel.r_addend as u64)
+                            }
+                        }
+                        _ => return Ok(()),
+                    };
+
+                    let delta = i128::from(target_address) - i128::from(place);
+                    // Definitely out of range for CALL26/JUMP26.
+                    let delta_i64 = i64::try_from(delta).unwrap_or(i64::MAX);
+
+                    if delta_i64 < rel_info.range.min || delta_i64 >= rel_info.range.max {
+                        required
+                            .entry((file_id, section.index.0))
+                            .or_default()
+                            .insert(target_address);
+                    }
+                    Ok(())
+                };
+
+                match relocations {
+                    RelocationList::Rela(rela) => {
+                        for rel in rela.crel_iter() {
+                            handle_rel(rel)?;
+                        }
+                    }
+                    RelocationList::Crel(crel) => {
+                        for rel in crel.flat_map(|r| r.ok()) {
+                            handle_rel(rel)?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(required)
+}
+
+fn build_aarch64_branch_thunk_plan<'data>(
+    group_states: &[GroupState<'data>],
+    required: &HashMap<(FileId, usize), HashSet<u64>>,
+) -> AArch64BranchThunks {
+    let mut out = AArch64BranchThunks::default();
+
+    for group_state in group_states {
+        for file in &group_state.files {
+            let FileLayoutState::Object(object) = file else {
+                continue;
+            };
+            let file_id = object.file_id();
+
+            for slot in &object.sections {
+                let SectionSlot::Loaded(section) = slot else {
+                    continue;
+                };
+                let Some(targets) = required.get(&(file_id, section.index.0)) else {
+                    continue;
+                };
+
+                let mut targets: Vec<u64> = targets.iter().copied().collect();
+                targets.sort_unstable();
+
+                let start_offset = AARCH64_BRANCH_THUNK_ALIGN.align_up(section.size);
+                let mut thunks = Vec::with_capacity(targets.len());
+                let mut by_target_address = HashMap::with_capacity(targets.len());
+                for (i, target_address) in targets.into_iter().enumerate() {
+                    let offset_in_section = start_offset + (i as u64) * AARCH64_BRANCH_THUNK_SIZE;
+                    let offset_in_section_u32 = u32::try_from(offset_in_section)
+                        .expect("Section size overflowed 32 bits when planning thunks");
+                    thunks.push(AArch64BranchThunk {
+                        target_address,
+                        offset_in_section: offset_in_section_u32,
+                    });
+                    by_target_address.insert(target_address, offset_in_section_u32);
+                }
+                out.sections.insert(
+                    (file_id, section.index.0),
+                    AArch64BranchThunkSection {
+                        thunks,
+                        by_target_address,
+                    },
+                );
+            }
+        }
+    }
+
+    out
+}
+
+fn apply_aarch64_branch_thunk_sizes<'data>(
+    group_states: &mut [GroupState<'data>],
+    section_part_sizes: &mut OutputSectionPartMap<u64>,
+    thunks: &AArch64BranchThunks,
+) -> Result<bool> {
+    let mut changed = false;
+
+    for group_state in group_states.iter_mut() {
+        for file in &mut group_state.files {
+            let FileLayoutState::Object(object) = file else {
+                continue;
+            };
+
+            let file_id = object.file_id();
+            for slot in &mut object.sections {
+                let SectionSlot::Loaded(section) = slot else {
+                    continue;
+                };
+
+                let Some(section_thunks) = thunks.section(file_id, section.index) else {
+                    continue;
+                };
+
+                let start_offset = AARCH64_BRANCH_THUNK_ALIGN.align_up(section.size);
+                let thunk_bytes = (section_thunks.thunks.len() as u64) * AARCH64_BRANCH_THUNK_SIZE;
+                let new_appended_bytes = (start_offset - section.size) + thunk_bytes;
+                if new_appended_bytes == section.appended_bytes {
+                    continue;
+                }
+
+                let old_capacity = {
+                    let old_size = section.size.saturating_add(section.appended_bytes);
+                    if section.part_id.should_pack() {
+                        old_size
+                    } else {
+                        section.part_id.alignment().align_up(old_size)
+                    }
+                };
+
+                section.appended_bytes = new_appended_bytes;
+
+                let new_capacity = section.capacity();
+                ensure!(
+                    new_capacity >= old_capacity,
+                    "AArch64 thunk planning unexpectedly reduced section capacity"
+                );
+                let delta = new_capacity - old_capacity;
+                group_state
+                    .common
+                    .mem_sizes
+                    .increment(section.part_id, delta);
+                section_part_sizes.increment(section.part_id, delta);
+                changed = true;
+            }
+        }
+    }
+
+    Ok(changed)
 }
 
 struct FinaliseSizesResources<'data, 'scope> {
@@ -857,6 +1455,8 @@ pub struct Layout<'data> {
     pub(crate) dynamic_symbol_definitions: Vec<DynamicSymbolDefinition<'data>>,
     pub(crate) gnu_property_notes: Vec<GnuProperty>,
     pub(crate) riscv_attributes: RiscVAttributes,
+
+    pub(crate) aarch64_branch_thunks: Option<AArch64BranchThunks>,
 }
 
 #[derive(Debug)]
@@ -1735,6 +2335,12 @@ pub(crate) struct Section {
     pub(crate) part_id: PartId,
     /// Size in memory.
     pub(crate) size: u64,
+
+    /// Extra bytes appended immediately after the section contents.
+    ///
+    /// Currently used for architecture-specific branch thunks that need to live close to the
+    /// calling section.
+    pub(crate) appended_bytes: u64,
     pub(crate) flags: ValueFlags,
     pub(crate) is_writable: bool,
 }
@@ -3233,6 +3839,7 @@ impl Section {
             index: section_index,
             part_id,
             size,
+            appended_bytes: 0,
             flags: ValueFlags::empty(),
             is_writable: SectionFlags::from_header(header).contains(shf::WRITE),
         };
@@ -3242,10 +3849,11 @@ impl Section {
     // How much space we take up. This is our size rounded up to the next multiple of our alignment,
     // unless we're in a packed section, in which case it's just our size.
     pub(crate) fn capacity(&self) -> u64 {
+        let size = self.size.saturating_add(self.appended_bytes);
         if self.part_id.should_pack() {
-            self.size
+            size
         } else {
-            self.alignment().align_up(self.size)
+            self.alignment().align_up(size)
         }
     }
 

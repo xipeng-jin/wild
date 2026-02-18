@@ -1297,7 +1297,7 @@ fn write_object_section<A: Arch>(
     table_writer: &mut TableWriter,
     trace: &TraceOutput,
 ) -> Result {
-    let out = write_section_raw(object, layout, section, buffers)?;
+    let WrittenSection { out, appended } = write_section_raw(object, layout, section, buffers)?;
 
     // We need to reverse the contents and adjust relocations because .ctors/.dtors are executed in
     // reverse order while .init_array/.fini_array are executed in forward order.
@@ -1329,6 +1329,20 @@ fn write_object_section<A: Arch>(
             object.input
         )
     })?;
+
+    if A::KIND == crate::arch::Architecture::AArch64 {
+        let section_address = object.section_resolutions[section.index.0]
+            .address()
+            .context("Attempted to write thunks for unloaded section")?;
+        write_aarch64_branch_thunks_for_section(
+            layout,
+            object,
+            section,
+            section_address,
+            out,
+            appended,
+        )?;
+    }
     if section.flags.needs_got() || section.flags.needs_plt() {
         bail!("Section has GOT or PLT");
     };
@@ -1412,7 +1426,11 @@ fn write_debug_section<A: Arch>(
     section: &Section,
     buffers: &mut OutputSectionPartMap<&mut [u8]>,
 ) -> Result {
-    let out = write_section_raw(object, layout, section, buffers)?;
+    let WrittenSection { out, appended } = write_section_raw(object, layout, section, buffers)?;
+    ensure!(
+        appended.is_empty(),
+        "Unexpected appended bytes in debug section"
+    );
     let relocations = object.relocations(section.index)?;
     let result = match relocations {
         elf::RelocationList::Rela(rela) => apply_debug_relocations::<A, _>(
@@ -1437,12 +1455,17 @@ fn write_debug_section<A: Arch>(
     Ok(())
 }
 
+struct WrittenSection<'out> {
+    out: &'out mut [u8],
+    appended: &'out mut [u8],
+}
+
 fn write_section_raw<'out>(
     object: &ObjectLayout,
     layout: &Layout,
     sec: &Section,
     buffers: &'out mut OutputSectionPartMap<&mut [u8]>,
-) -> Result<&'out mut [u8]> {
+) -> Result<WrittenSection<'out>> {
     if layout
         .output_sections
         .has_data_in_file(sec.output_section_id())
@@ -1461,14 +1484,106 @@ fn write_section_raw<'out>(
         // Cut off any padding so that our output buffer is the size of our input buffer.
         let object_section = object.object.section(sec.index)?;
         let section_size = object.object.section_size(object_section)?;
-        let (out, padding) = out.split_at_mut(section_size as usize);
+        let (out, after_section) = out.split_at_mut(section_size as usize);
+        let appended_len = usize::try_from(sec.appended_bytes)
+            .context("Section appended bytes overflowed usize")?;
+        ensure!(
+            appended_len <= after_section.len(),
+            "Insufficient space allocated for appended bytes in section `{}`",
+            object.object.section_display_name(sec.index),
+        );
+        let (appended, padding) = after_section.split_at_mut(appended_len);
         object.object.copy_section_data(object_section, out)?;
-        // Fill padding. This is especially important if we're writing the file in place.
+        // Fill appended + padding. This is especially important if we're writing the file in place.
+        appended.fill(0);
         padding.fill(0);
-        Ok(out)
+        Ok(WrittenSection { out, appended })
     } else {
-        Ok(&mut [])
+        Ok(WrittenSection {
+            out: &mut [],
+            appended: &mut [],
+        })
     }
+}
+
+fn write_aarch64_branch_thunks_for_section(
+    layout: &Layout,
+    object: &ObjectLayout,
+    section: &Section,
+    section_address: u64,
+    out: &[u8],
+    appended: &mut [u8],
+) -> Result {
+    let Some(thunks) = layout.aarch64_branch_thunks.as_ref() else {
+        return Ok(());
+    };
+    let Some(section_thunks) = thunks.section(object.file_id, section.index) else {
+        return Ok(());
+    };
+
+    let section_size = out.len();
+    for thunk in &section_thunks.thunks {
+        let offset_in_section =
+            usize::try_from(thunk.offset_in_section).context("Thunk offset overflowed usize")?;
+        ensure!(
+            offset_in_section >= section_size,
+            "Thunk offset is before section contents"
+        );
+        let offset_in_appended = offset_in_section - section_size;
+        ensure!(
+            offset_in_appended + AARCH64_BRANCH_THUNK_BYTES <= appended.len(),
+            "Insufficient appended space for AArch64 branch thunks"
+        );
+        let thunk_out =
+            &mut appended[offset_in_appended..offset_in_appended + AARCH64_BRANCH_THUNK_BYTES];
+        let thunk_address = section_address.wrapping_add(u64::from(thunk.offset_in_section));
+        write_aarch64_branch_thunk(thunk_out, thunk_address, thunk.target_address)?;
+    }
+
+    Ok(())
+}
+
+const AARCH64_BRANCH_THUNK_BYTES: usize = 12;
+
+const AARCH64_BRANCH_THUNK_TEMPLATE: [u8; AARCH64_BRANCH_THUNK_BYTES] = [
+    0x10, 0x00, 0x00, 0x90, // adrp x16, #0
+    0x10, 0x02, 0x00, 0x91, // add  x16, x16, #0
+    0x00, 0x02, 0x1f, 0xd6, // br   x16
+];
+
+fn write_aarch64_branch_thunk(out: &mut [u8], thunk_address: u64, target_address: u64) -> Result {
+    ensure!(
+        out.len() == AARCH64_BRANCH_THUNK_BYTES,
+        "Unexpected AArch64 branch thunk buffer size"
+    );
+    out.copy_from_slice(&AARCH64_BRANCH_THUNK_TEMPLATE);
+
+    // Patch ADRP immediate.
+    let thunk_page = thunk_address & !0xfffu64;
+    let target_page = target_address & !0xfffu64;
+    let page_delta = (target_page as i64).wrapping_sub(thunk_page as i64) >> 12;
+    ensure!(
+        (-(1 << 20)..(1 << 20)).contains(&page_delta),
+        "AArch64 branch thunk target is out of ADRP range"
+    );
+    let mut adrp = u32::from_le_bytes(out[0..4].try_into().unwrap());
+    // Clear immlo (30:29) and immhi (23:5)
+    adrp &= !0x60ffffe0;
+    let page_delta_u = page_delta as i32 as u32;
+    let immlo = page_delta_u & 0x3;
+    let immhi = (page_delta_u >> 2) & 0x7ffff;
+    adrp |= immlo << 29;
+    adrp |= immhi << 5;
+    out[0..4].copy_from_slice(&adrp.to_le_bytes());
+
+    // Patch ADD immediate (low 12 bits).
+    let low12 = (target_address & 0xfffu64) as u32;
+    let mut add = u32::from_le_bytes(out[4..8].try_into().unwrap());
+    add &= !(0xfff << 10);
+    add |= low12 << 10;
+    out[4..8].copy_from_slice(&add.to_le_bytes());
+
+    Ok(())
 }
 
 /// Writes debug symbols.
@@ -1581,6 +1696,7 @@ fn apply_relocations<A: Arch, I: Iterator<Item = object::Result<Crel>> + Clone>(
         let offset_in_section = rel.r_offset;
         modifier = apply_relocation::<A, _>(
             object,
+            section.index,
             offset_in_section,
             &rel,
             SectionInfo {
@@ -1676,6 +1792,7 @@ fn write_eh_frame_data<A: Arch>(
     match object.relocations(eh_frame_section_index)? {
         elf::RelocationList::Rela(relocations) => write_eh_frame_relocations::<A>(
             object,
+            eh_frame_section_index,
             layout,
             table_writer,
             trace,
@@ -1684,6 +1801,7 @@ fn write_eh_frame_data<A: Arch>(
         ),
         elf::RelocationList::Crel(relocations) => write_eh_frame_relocations::<A>(
             object,
+            eh_frame_section_index,
             layout,
             table_writer,
             trace,
@@ -1695,6 +1813,7 @@ fn write_eh_frame_data<A: Arch>(
 
 fn write_eh_frame_relocations<A: Arch>(
     object: &ObjectLayout<'_>,
+    eh_frame_section_index: object::SectionIndex,
     layout: &Layout<'_>,
     table_writer: &mut TableWriter<'_, '_>,
     trace: &TraceOutput,
@@ -1805,6 +1924,7 @@ fn write_eh_frame_relocations<A: Arch>(
                 }
                 apply_relocation::<A, _>(
                     object,
+                    eh_frame_section_index,
                     rel_offset - input_pos as u64,
                     rel,
                     SectionInfo {
@@ -2076,6 +2196,7 @@ fn get_pair_subtraction_relocation_value<A: Arch>(
 #[inline(always)]
 fn apply_relocation<A: Arch, I: Iterator<Item = object::Result<Crel>> + Clone>(
     object_layout: &ObjectLayout,
+    input_section_index: object::SectionIndex,
     mut offset_in_section: u64,
     rel: &Crel,
     section_info: SectionInfo,
@@ -2518,6 +2639,36 @@ fn apply_relocation<A: Arch, I: Iterator<Item = object::Result<Crel>> + Clone>(
             value_hex = %HexU64::new(value),
             symbol_name = %layout.symbol_db.symbol_name_for_display(local_symbol_id),
             "relocation applied");
+    }
+
+    if A::KIND == crate::arch::Architecture::AArch64
+        && (r_type == object::elf::R_AARCH64_CALL26 || r_type == object::elf::R_AARCH64_JUMP26)
+    {
+        let delta = value as i64;
+        if delta < rel_info.range.min || delta >= rel_info.range.max {
+            let target_address = place.wrapping_add(value);
+            let thunks = layout
+                .aarch64_branch_thunks
+                .as_ref()
+                .context("AArch64 branch thunks missing")?;
+            let thunk_offset = thunks
+                .thunk_offset_for_target(object_layout.file_id, input_section_index, target_address)
+                .with_context(|| {
+                    format!(
+                        "Missing AArch64 branch thunk for target 0x{:x} in {} section `{}`",
+                        target_address,
+                        object_layout.input,
+                        object_layout
+                            .object
+                            .section_display_name(input_section_index)
+                    )
+                })?;
+            let thunk_address = section_address.wrapping_add(u64::from(thunk_offset));
+            let thunk_delta = i128::from(thunk_address) - i128::from(place);
+            let thunk_delta_i64 =
+                i64::try_from(thunk_delta).context("AArch64 branch thunk delta overflow")?;
+            value = thunk_delta_i64 as u64;
+        }
     }
 
     write_relocation_to_buffer(rel_info, value, &mut out[offset_in_section..])?;

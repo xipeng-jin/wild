@@ -3295,22 +3295,24 @@ impl PartialEq for ErrorMatcher {
 impl Eq for ErrorMatcher {}
 
 fn available_linkers() -> Result<Vec<Linker>> {
-    let mut linkers = vec![
-        Linker::ThirdParty(ThirdPartyLinker {
-            name: "ld",
-            gcc_name: "bfd",
-            path: find_bin(&["ld.bfd", "ld"])?,
-            cross_paths: find_cross_paths("ld"),
-            enabled_by_default: true,
-        }),
-        Linker::ThirdParty(ThirdPartyLinker {
+    let mut linkers = vec![Linker::ThirdParty(ThirdPartyLinker {
+        name: "ld",
+        gcc_name: "bfd",
+        path: find_bin(&["ld.bfd", "ld"])?,
+        cross_paths: find_cross_paths("ld"),
+        enabled_by_default: true,
+    })];
+
+    // lld is optional for the test suite.
+    if let Ok(path) = find_bin(&["ld.lld"]) {
+        linkers.push(Linker::ThirdParty(ThirdPartyLinker {
             name: "lld",
             gcc_name: "lld",
-            path: find_bin(&["ld.lld"])?,
+            path,
             cross_paths: find_cross_paths("ld.lld"),
             enabled_by_default: false,
-        }),
-    ];
+        }));
+    }
 
     // We don't need gold and mold for our tests, they're just there for the odd occasion when we're
     // curious and looking for extra data points as to how other linkers handle a particular case.
@@ -3514,6 +3516,7 @@ fn integration_test(
         "linker-script-defsym-notfound.c",
         "tls-common.c",
         "section-start.c",
+        "aarch64-branch-thunk.c",
         "max-page-size.c",
         "call-via-defsym.c",
         "wrap-real-only.c",
